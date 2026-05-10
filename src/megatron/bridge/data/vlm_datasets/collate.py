@@ -16,6 +16,7 @@
 Collation utilities for building VLM training batches from conversation examples.
 """
 
+import re
 import warnings
 from typing import Any
 
@@ -66,43 +67,179 @@ def _gather_assistant_text_segments(example: dict) -> list[str]:
     return texts
 
 
-def create_multiturn_loss_mask_by_search(
+def _has_generation_block(template: str) -> bool:
+    return re.search(r"\{\%-?\s*generation\s*-?\%\}", template) is not None
+
+
+def _assistant_generation_chat_template(processor) -> str:
+    """Return a chat template that can emit assistant token masks.
+
+    HF's return_assistant_tokens_mask requires {% generation %} blocks in the
+    chat template. Qwen3.5's default template in the NeMo container supports the
+    API but lacks those blocks, so this function must add them around assistant
+    content in-memory. If that patch cannot be applied exactly, fail loudly.
+    """
+    cache_attr = "_bridge_assistant_generation_chat_template"
+    if hasattr(processor, cache_attr):
+        return getattr(processor, cache_attr)
+
+    tokenizer = getattr(processor, "tokenizer", processor)
+    template = getattr(tokenizer, "chat_template", None)
+    if not isinstance(template, str) or not template:
+        raise RuntimeError("Tokenizer does not expose a chat_template; cannot build assistant loss mask.")
+
+    if _has_generation_block(template):
+        setattr(processor, cache_attr, template)
+        return template
+
+    # Qwen3.5 template: keep the assistant role header outside the generation
+    # block, then mark the actual assistant answer tokens.
+    old_reasoning = (
+        "{{- '<|im_start|>' + message.role + '\\n<think>\\n' + reasoning_content "
+        "+ '\\n</think>\\n\\n' + content }}"
+    )
+    new_reasoning = (
+        "{{- '<|im_start|>' + message.role + '\\n' }}{% generation %}"
+        "{{- '<think>\\n' + reasoning_content + '\\n</think>\\n\\n' + content }}"
+        "{% endgeneration %}"
+    )
+    old_content = "{{- '<|im_start|>' + message.role + '\\n' + content }}"
+    new_content = (
+        "{{- '<|im_start|>' + message.role + '\\n' }}{% generation %}"
+        "{{- content }}{% endgeneration %}"
+    )
+
+    has_old_reasoning = old_reasoning in template
+    has_old_content = old_content in template
+    if not (has_old_reasoning and has_old_content):
+        raise RuntimeError(
+            "Qwen chat template does not contain {% generation %}, but the expected assistant render snippets "
+            "were not found for strict in-memory patching. "
+            f"old_reasoning_found={has_old_reasoning}, old_content_found={has_old_content}"
+        )
+
+    template = template.replace(old_reasoning, new_reasoning).replace(old_content, new_content)
+    if not _has_generation_block(template):
+        raise RuntimeError("Failed to add {% generation %} blocks to chat template.")
+
+    setattr(processor, cache_attr, template)
+    return template
+
+
+def _to_int_list(values: Any) -> list[int]:
+    if isinstance(values, torch.Tensor):
+        values = values.tolist()
+    return list(values)
+
+
+def _assistant_mask_self_test(processor, chat_template: str) -> None:
+    """Run once per processor before the first real sample to verify mask semantics."""
+    cache_attr = "_bridge_assistant_mask_self_test_done"
+    if getattr(processor, cache_attr, False):
+        return
+
+    tokenizer = getattr(processor, "tokenizer", processor)
+    expected_assistant_text = "<think>\nbridge\n</think>\n\n<retrieve>{}</retrieve>"
+    conversation = [
+        {"role": "user", "content": [{"type": "text", "text": "Question?"}]},
+        {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "<think>\nbridge\n</think>\n<retrieve>{}</retrieve>"}],
+        },
+    ]
+
+    rendered = processor.apply_chat_template(conversation, tokenize=False)
+    collator_ids = _to_int_list(processor(text=[rendered], padding=False, return_tensors=None)["input_ids"][0])
+
+    encoded = tokenizer.apply_chat_template(
+        conversation,
+        tokenize=True,
+        return_dict=True,
+        return_assistant_tokens_mask=True,
+        add_generation_prompt=False,
+        chat_template=chat_template,
+    )
+    template_ids = _to_int_list(encoded["input_ids"])
+    assistant_mask = _to_int_list(encoded["assistant_masks"])
+    if template_ids != collator_ids:
+        raise RuntimeError("Assistant-mask self-test failed: patched template changed tokenization.")
+    if len(template_ids) != len(assistant_mask) or sum(assistant_mask) == 0:
+        raise RuntimeError("Assistant-mask self-test failed: empty or malformed assistant mask.")
+
+    assistant_ids = [token_id for token_id, mask_value in zip(template_ids, assistant_mask) if mask_value]
+    decoded_assistant = tokenizer.decode(assistant_ids)
+    if decoded_assistant != expected_assistant_text:
+        raise RuntimeError(
+            "Assistant-mask self-test failed: decoded assistant span mismatch. "
+            f"expected={expected_assistant_text!r}, actual={decoded_assistant!r}"
+        )
+    if "<|im_start|>assistant" in decoded_assistant or "<|im_end|>" in decoded_assistant:
+        raise RuntimeError("Assistant-mask self-test failed: assistant mask includes chat-template control tokens.")
+
+    setattr(processor, cache_attr, True)
+
+
+def _ensure_assistant_mask_template_ready(processor) -> str:
+    chat_template = _assistant_generation_chat_template(processor)
+    _assistant_mask_self_test(processor, chat_template)
+    return chat_template
+
+
+def _assistant_mask_from_chat_template(example: dict, ids: list[int], processor) -> list[int]:
+    """Use HF chat-template assistant masks as the only supported loss-mask path."""
+    conversation = example.get("conversation", [])
+    if not isinstance(conversation, list):
+        raise ValueError("Expected example['conversation'] to be a list.")
+
+    tokenizer = getattr(processor, "tokenizer", processor)
+    if not hasattr(tokenizer, "apply_chat_template"):
+        raise RuntimeError("Tokenizer does not support apply_chat_template; cannot build assistant loss mask.")
+
+    chat_template = _ensure_assistant_mask_template_ready(processor)
+
+    try:
+        encoded = tokenizer.apply_chat_template(
+            conversation,
+            tokenize=True,
+            return_dict=True,
+            return_assistant_tokens_mask=True,
+            add_generation_prompt=False,
+            chat_template=chat_template,
+        )
+    except Exception as exc:
+        raise RuntimeError("Failed to apply chat template with return_assistant_tokens_mask=True.") from exc
+
+    template_ids = encoded.get("input_ids")
+    assistant_mask = encoded.get("assistant_masks")
+    if assistant_mask is None:
+        assistant_mask = encoded.get("assistant_tokens_mask")
+    if template_ids is None or assistant_mask is None:
+        raise RuntimeError("Chat template did not return input_ids and assistant mask.")
+    template_ids = _to_int_list(template_ids)
+    assistant_mask = _to_int_list(assistant_mask)
+    if len(template_ids) != len(assistant_mask) or sum(assistant_mask) == 0:
+        raise RuntimeError(
+            "Chat template returned an empty or malformed assistant mask. "
+            f"token_len={len(template_ids)}, mask_len={len(assistant_mask)}, mask_sum={sum(assistant_mask)}"
+        )
+
+    # Collators tokenize unpadded single examples here, then pad in the batch.
+    # Reuse the mask only when it matches the actual input-id prefix exactly.
+    if len(template_ids) > len(ids) or ids[: len(template_ids)] != template_ids:
+        raise RuntimeError(
+            "Assistant-mask tokenization does not match collator input_ids. "
+            f"template_len={len(template_ids)}, collator_len={len(ids)}"
+        )
+
+    return assistant_mask + [0] * (len(ids) - len(assistant_mask))
+
+
+def create_multiturn_loss_mask_by_chat_template(
     example: dict, input_ids, processor, skipped_tokens: torch.Tensor
 ) -> list[int]:
-    """Tokenizer-agnostic masking via substring search of assistant texts.
-
-    - Tokenize full conversation with processor already done -> input_ids
-    - Extract assistant text strings from the structured example
-    - For each assistant text, tokenize without special tokens and search sequentially
-    - On success, unmask that span; otherwise leave masked
-    """
-    tokenizer = getattr(processor, "tokenizer", processor)
+    """Build assistant loss mask from HF chat-template generation blocks."""
     ids = input_ids.tolist()
-    mask = [0] * len(ids)
-
-    def try_mark(span_text: str, start_from: int) -> int:
-        """Tokenize a span and mark its occurrence if found. Returns new search start index."""
-        variants = [span_text, span_text + "\n", span_text.strip(), span_text.strip() + "\n"]
-        for text in variants:
-            span_tokens = tokenizer(text, add_special_tokens=False)["input_ids"]
-            if not span_tokens:
-                continue
-            # naive sequential search from start_from
-            for i in range(start_from, len(ids) - len(span_tokens) + 1):
-                if ids[i : i + len(span_tokens)] == span_tokens:
-                    for j in range(i, i + len(span_tokens)):
-                        mask[j] = 1
-                    return i + len(span_tokens)
-        return start_from
-
-    search_start = 0
-    for asst_text in _gather_assistant_text_segments(example):
-        search_start = try_mark(asst_text, search_start)
-
-    if sum(mask) == 0:
-        warnings.warn("*" * 100)
-        warnings.warn(f"All tokens are masked for example:\n{example}.")
-        warnings.warn("*" * 100)
+    mask = _assistant_mask_from_chat_template(example, ids, processor)
 
     # Ensure pad/skipped tokens are masked
     ids_t = torch.tensor(ids)
@@ -161,6 +298,7 @@ def qwen2_5_collate_fn(examples: list, processor) -> dict[str, torch.Tensor]:
         raise ImportError(MISSING_QWEN_VL_UTILS_MSG)
 
     skipped_tokens = extract_skipped_token_ids(processor)
+    _ensure_assistant_mask_template_ready(processor)
 
     texts = [processor.apply_chat_template(example["conversation"], tokenize=False) for example in examples]
     # Build per-example images (list) and split by presence
@@ -256,7 +394,7 @@ def qwen2_5_collate_fn(examples: list, processor) -> dict[str, torch.Tensor]:
         )
     # Prefer general search-based masking using structured example content (not template-specific)
     loss_masks = [
-        create_multiturn_loss_mask_by_search(example, input_ids, processor, skipped_tokens)
+        create_multiturn_loss_mask_by_chat_template(example, input_ids, processor, skipped_tokens)
         for example, input_ids in zip(examples, batch["input_ids"])  # type: ignore[arg-type]
     ]
     loss_mask_t = torch.tensor(loss_masks, dtype=torch.float, device=batch["input_ids"].device)
@@ -327,7 +465,7 @@ def nemotron_nano_v2_vl_collate_fn(examples: list, processor, start_of_response_
             return_dict=True,
         )
     loss_mask = [
-        create_multiturn_loss_mask_by_search(example, input_ids, processor, skipped_tokens)
+        create_multiturn_loss_mask_by_chat_template(example, input_ids, processor, skipped_tokens)
         for example, input_ids in zip(examples, batch["input_ids"])  # type: ignore[arg-type]
     ]
 
@@ -443,7 +581,7 @@ def ministral3_collate_fn(examples: list, processor) -> dict[str, torch.Tensor]:
 
         # Create loss mask using search-based masking for assistant turns
         loss_masks = [
-            create_multiturn_loss_mask_by_search(example, input_ids, processor, skipped_tokens)
+            create_multiturn_loss_mask_by_chat_template(example, input_ids, processor, skipped_tokens)
             for example, input_ids in zip(examples, batch["input_ids"])
         ]
         loss_mask_t = torch.tensor(loss_masks, dtype=torch.float, device=batch["input_ids"].device)
@@ -510,7 +648,7 @@ def glm4v_collate_fn(examples: list, processor) -> dict[str, torch.Tensor]:
     batch["labels"] = labels
 
     loss_masks = [
-        create_multiturn_loss_mask_by_search(example, input_ids, processor, skipped_tokens)
+        create_multiturn_loss_mask_by_chat_template(example, input_ids, processor, skipped_tokens)
         for example, input_ids in zip(examples, batch["input_ids"])
     ]
     loss_mask_t = torch.tensor(loss_masks, dtype=torch.float, device=batch["input_ids"].device)
@@ -576,7 +714,7 @@ def default_collate_fn(examples: list, processor) -> dict[str, torch.Tensor]:
     labels[torch.isin(labels, skipped_tokens)] = -100
     batch["labels"] = labels
     loss_masks = [
-        create_multiturn_loss_mask_by_search(example, input_ids, processor, skipped_tokens)
+        create_multiturn_loss_mask_by_chat_template(example, input_ids, processor, skipped_tokens)
         for example, input_ids in zip(examples, batch["input_ids"])  # type: ignore[arg-type]
     ]
     loss_mask_t = torch.tensor(loss_masks, dtype=torch.float, device=batch["input_ids"].device)
@@ -914,7 +1052,7 @@ def kimi_k25_vl_collate_fn(
         )
     # Prefer general search-based masking using structured example content (not template-specific)
     loss_masks = [
-        create_multiturn_loss_mask_by_search(example, input_ids, processor, skipped_tokens)
+        create_multiturn_loss_mask_by_chat_template(example, input_ids, processor, skipped_tokens)
         for example, input_ids in zip(examples, result["input_ids"])  # type: ignore[arg-type]
     ]
     loss_mask_t = torch.tensor(loss_masks, dtype=torch.float, device=result["input_ids"].device)

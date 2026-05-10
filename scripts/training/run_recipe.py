@@ -151,6 +151,18 @@ ERR_INFER_MODE_FAILED = (
 )
 
 
+def str_to_bool(value: str | bool) -> bool:
+    """Parse common shell boolean values."""
+    if isinstance(value, bool):
+        return value
+    lowered = value.lower()
+    if lowered in {"1", "true", "yes", "y", "on"}:
+        return True
+    if lowered in {"0", "false", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Invalid boolean value: {value}")
+
+
 def parse_args() -> tuple[argparse.Namespace, list[str]]:
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
@@ -194,6 +206,30 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
         type=str,
         default=None,
         help="PEFT scheme to use: 'lora', 'dora', or None.",
+    )
+    parser.add_argument(
+        "--peft_dim",
+        type=int,
+        default=None,
+        help="Override PEFT LoRA/DoRA rank before Hydra override processing.",
+    )
+    parser.add_argument(
+        "--peft_alpha",
+        type=int,
+        default=None,
+        help="Override PEFT LoRA/DoRA alpha before Hydra override processing.",
+    )
+    parser.add_argument(
+        "--peft_dropout",
+        type=float,
+        default=None,
+        help="Override PEFT LoRA/DoRA dropout before Hydra override processing.",
+    )
+    parser.add_argument(
+        "--peft_normalize_moe_lora",
+        type=str_to_bool,
+        default=None,
+        help="Override PEFT normalize_moe_lora before Hydra override processing.",
     )
     parser.add_argument(
         "--packed_sequence",
@@ -256,21 +292,23 @@ def load_recipe(
         params = sig.parameters
         has_var_keyword = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
 
-        accepts_peft = "peft" in params or has_var_keyword
+        accepts_peft = "peft" in params or "peft_scheme" in params or has_var_keyword
+        accepts_peft_scheme = "peft_scheme" in params
         accepts_packed_sequence = "packed_sequence" in params or has_var_keyword
         accepts_seq_length = "seq_length" in params or has_var_keyword
         accepts_hf_path = "hf_path" in params or has_var_keyword
     except (ValueError, TypeError):
         # If signature inspection fails, fallback conservatively
         accepts_peft = True  # peft is widely supported, try passing it
+        accepts_peft_scheme = False
         accepts_packed_sequence = False  # new parameter, don't pass if unsure
         accepts_seq_length = False  # new parameter, don't pass if unsure
         accepts_hf_path = False  # model-specific, don't pass if unsure
 
     # Build kwargs dynamically based on what the recipe accepts
     kwargs = {}
-    if accepts_peft:
-        kwargs["peft"] = peft_scheme
+    if accepts_peft and peft_scheme is not None:
+        kwargs["peft_scheme" if accepts_peft_scheme else "peft"] = peft_scheme
     if accepts_packed_sequence and packed_sequence:
         kwargs["packed_sequence"] = packed_sequence
     if accepts_seq_length and seq_length is not None:
@@ -283,6 +321,31 @@ def load_recipe(
     except TypeError:
         # Fallback if the kwargs are not accepted despite signature inspection
         return config_builder()
+
+
+def apply_peft_overrides(
+    config: ConfigContainer,
+    *,
+    dim: int | None = None,
+    alpha: int | None = None,
+    dropout: float | None = None,
+    normalize_moe_lora: bool | None = None,
+) -> None:
+    """Apply PEFT overrides directly because PEFT callables are excluded from OmegaConf."""
+    peft = getattr(config, "peft", None)
+    if peft is None:
+        return
+
+    for attr, value in (
+        ("dim", dim),
+        ("alpha", alpha),
+        ("dropout", dropout),
+        ("normalize_moe_lora", normalize_moe_lora),
+    ):
+        if value is not None:
+            if not hasattr(peft, attr):
+                raise ValueError(f"PEFT object {type(peft).__name__} has no attribute {attr!r}")
+            setattr(peft, attr, value)
 
 
 def load_forward_step(step_type: str, mode: str | None = None) -> Callable:
@@ -318,6 +381,13 @@ def main() -> None:
         args.packed_sequence,
         args.seq_length,
         args.hf_path,
+    )
+    apply_peft_overrides(
+        config,
+        dim=args.peft_dim,
+        alpha=args.peft_alpha,
+        dropout=args.peft_dropout,
+        normalize_moe_lora=args.peft_normalize_moe_lora,
     )
 
     if args.dataset is not None:
