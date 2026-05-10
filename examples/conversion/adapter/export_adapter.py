@@ -61,6 +61,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output", type=Path, default=Path("./my_adapter"))
     parser.add_argument("--trust-remote-code", action="store_true")
+    parser.add_argument(
+        "--disable-mtp",
+        action="store_true",
+        help="Set provider.mtp_num_layers=None before exporting. Use this when the PEFT checkpoint was trained with MTP disabled.",
+    )
     return parser.parse_args()
 
 
@@ -69,6 +74,17 @@ def main() -> None:
     args = parse_args()
 
     bridge = AutoBridge.from_hf_pretrained(args.hf_model_path, trust_remote_code=args.trust_remote_code)
+    if args.disable_mtp:
+        original_to_megatron_provider = bridge.to_megatron_provider
+
+        def to_megatron_provider_with_mtp_disabled(*args, **kwargs):
+            provider = original_to_megatron_provider(*args, **kwargs)
+            if hasattr(provider, "mtp_num_layers"):
+                provider.mtp_num_layers = None
+            return provider
+
+        bridge.to_megatron_provider = to_megatron_provider_with_mtp_disabled
+
     bridge.export_adapter_ckpt(
         peft_checkpoint=args.lora_checkpoint,
         output_path=args.output,
