@@ -93,15 +93,17 @@ def _assistant_generation_chat_template(processor) -> str:
         return template
 
     # Qwen3.5 template: keep the assistant role header outside the generation
-    # block, then mark the actual assistant answer tokens.
+    # block, then mark only the supervised assistant answer tokens.  For this
+    # retrieval SFT path we explicitly do not train the native Qwen <think>
+    # channel; reasoning_content is ignored if the source template would have
+    # rendered it before content.
     old_reasoning = (
         "{{- '<|im_start|>' + message.role + '\\n<think>\\n' + reasoning_content "
         "+ '\\n</think>\\n\\n' + content }}"
     )
     new_reasoning = (
         "{{- '<|im_start|>' + message.role + '\\n' }}{% generation %}"
-        "{{- '<think>\\n' + reasoning_content + '\\n</think>\\n\\n' + content }}"
-        "{% endgeneration %}"
+        "{{- content }}{% endgeneration %}"
     )
     old_content = "{{- '<|im_start|>' + message.role + '\\n' + content }}"
     new_content = (
@@ -139,16 +141,16 @@ def _assistant_mask_self_test(processor, chat_template: str) -> None:
         return
 
     tokenizer = getattr(processor, "tokenizer", processor)
-    expected_assistant_text = "<think>\nbridge\n</think>\n\n<retrieve>{}</retrieve>"
+    expected_assistant_text = "<retrieve>\nbridge\n</retrieve>\n<support>[1]</support>"
     conversation = [
         {"role": "user", "content": [{"type": "text", "text": "Question?"}]},
         {
             "role": "assistant",
-            "content": [{"type": "text", "text": "<think>\nbridge\n</think>\n<retrieve>{}</retrieve>"}],
+            "content": [{"type": "text", "text": expected_assistant_text}],
         },
     ]
 
-    rendered = processor.apply_chat_template(conversation, tokenize=False)
+    rendered = processor.apply_chat_template(conversation, tokenize=False, chat_template=chat_template)
     collator_ids = _to_int_list(processor(text=[rendered], padding=False, return_tensors=None)["input_ids"][0])
 
     encoded = tokenizer.apply_chat_template(
@@ -300,7 +302,11 @@ def qwen2_5_collate_fn(examples: list, processor) -> dict[str, torch.Tensor]:
     skipped_tokens = extract_skipped_token_ids(processor)
     _ensure_assistant_mask_template_ready(processor)
 
-    texts = [processor.apply_chat_template(example["conversation"], tokenize=False) for example in examples]
+    chat_template = _ensure_assistant_mask_template_ready(processor)
+    texts = [
+        processor.apply_chat_template(example["conversation"], tokenize=False, chat_template=chat_template)
+        for example in examples
+    ]
     # Build per-example images (list) and split by presence
     per_example_images = []
     has_images = []
