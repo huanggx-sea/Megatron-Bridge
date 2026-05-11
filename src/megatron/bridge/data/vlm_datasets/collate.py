@@ -141,7 +141,20 @@ def _assistant_mask_self_test(processor, chat_template: str) -> None:
         return
 
     tokenizer = getattr(processor, "tokenizer", processor)
-    expected_assistant_text = "<retrieve>\nbridge\n</retrieve>\n<support>[1]</support>"
+    expected_assistant_text = (
+        '<retrieve budget="2">\n'
+        "hop 1:\n"
+        "bridge\n"
+        "evidence: DOC_1 quote=\"x\"\n"
+        "\n"
+        "candidate_evidence:\n"
+        "candidate: DOC_1 quote=\"x\"\n"
+        "candidate: DOC_2 quote=\"y\"\n"
+        "\n"
+        "<candidates>[1,2]</candidates>\n"
+        "<support>[1]</support>\n"
+        "</retrieve>"
+    )
     conversation = [
         {"role": "user", "content": [{"type": "text", "text": "Question?"}]},
         {
