@@ -148,7 +148,6 @@ def _assistant_mask_self_test(processor, chat_template: str) -> None:
         "evidence: DOC_1 quote=\"x\"\n"
         "\n"
         "<candidates>[1,2]</candidates>\n"
-        "<support>[1]</support>\n"
         "</retrieve>"
     )
     conversation = [
