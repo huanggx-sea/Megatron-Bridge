@@ -156,7 +156,7 @@ class _ToyAdapterModel(torch.nn.Module):
 def _adapter_export(name: str, tensor: torch.Tensor) -> HFWeightTuple:
     """Build a raw adapter export record."""
 
-    return HFWeightTuple(param_name=name, weight=tensor)
+    return HFWeightTuple(param_name=name, weight=tensor, megatron_param_name=name)
 
 
 class TestBuildAdapterConfigDict:

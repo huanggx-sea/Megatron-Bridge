@@ -828,6 +828,12 @@ class DirectMapping(MegatronParamMapping[torch.Tensor]):
         return {str(self.hf_param): megatron_weights}
 
 
+def _pad_right_dim0(x: torch.Tensor, pad_size: int) -> torch.Tensor:
+    """Append `pad_size` zero rows to `x` along dim 0."""
+    padder = torch.zeros((pad_size, *x.shape[1:]), dtype=x.dtype, device=x.device)
+    return torch.cat([x, padder], dim=0)
+
+
 class ColumnParallelMapping(MegatronParamMapping[torch.Tensor]):
     """
     Mapping for column-parallel linear and embedding weights.
@@ -903,6 +909,25 @@ class ColumnParallelMapping(MegatronParamMapping[torch.Tensor]):
                         f"to {target_param.dtype} (further warnings suppressed)."
                     )
                 hf_weights = hf_weights.to(target_param.dtype)
+
+            # Vocab dim is padded in Megatron (make_vocab_size_divisible_by × tp_size)
+            # but unpadded in HF. Pad HF tensor's dim 0 with zeros to match.
+            # Any other dim-0 mismatch is a bug — surface it via the assert.
+            # Paired with slime's remove_padding on the Megatron→HF export side.
+            actual_dim0_size = hf_weights.shape[0]
+            expect_dim0_size = target_param.shape[0] * self.tp_size
+            if actual_dim0_size != expect_dim0_size:
+                assert self.megatron_param in {
+                    "embedding.word_embeddings.weight",
+                    "output_layer.weight",
+                }, (
+                    f"Unexpected dim-0 mismatch: {hf_weights.shape=} "
+                    f"{target_param.shape=} {self.tp_size=} "
+                    f"{self.megatron_param=} {self.hf_param=}"
+                )
+                hf_weights = _pad_right_dim0(
+                    hf_weights, pad_size=expect_dim0_size - actual_dim0_size
+                )
 
             # For bias (1D), we still split along dim 0
             # For weight (2D), we split along dim 0 (output dimension)

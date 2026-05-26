@@ -583,7 +583,11 @@ class AutoBridge(Generic[MegatronModelT]):
             dist.barrier()
 
         raw_adapter_weights = [
-            HFWeightTuple(exported_weight.param_name, exported_weight.weight.clone().float())
+            HFWeightTuple(
+                exported_weight.param_name,
+                exported_weight.weight.clone().float(),
+                exported_weight.megatron_param_name,
+            )
             for exported_weight in self.export_adapter_weights(model, cpu=True, show_progress=show_progress)
         ]
         if not raw_adapter_weights:
