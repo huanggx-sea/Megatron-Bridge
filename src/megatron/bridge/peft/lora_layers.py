@@ -12,13 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 import math
 from typing import Any, Literal, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
-import transformer_engine.pytorch as te
 from megatron.core.transformer.moe.moe_utils import apply_random_logits
+
+try:
+    import transformer_engine.pytorch as te
+    _TE_AVAILABLE = True
+    _TELinearBase = te.Linear
+except ImportError:
+    te = None  # type: ignore[assignment]
+    _TE_AVAILABLE = False
+    _TELinearBase = object  # dummy base so TELinearAdapter class definition succeeds
 
 from megatron.bridge.peft.adapter_wrapper import AdapterWrapper
 from megatron.bridge.utils.import_utils import safe_import
@@ -78,7 +88,7 @@ class LoRATopKRouter(AdapterWrapper):
         return self.to_wrap.routing(logits, *args, **kwargs)
 
 
-class TELinearAdapter(te.Linear):
+class TELinearAdapter(_TELinearBase):  # _TELinearBase = te.Linear when TE is available, object otherwise
     """
     TELinear + LoRA, maintains ckpts structure (i.e. Linear's weight/bias remain at the same FQN)
 
@@ -679,21 +689,21 @@ def patch_linear_module(
         NotImplementedError: If orig_linear is not nn.Linear or te.Linear.
         AssertionError: If orig_linear already has super_fwd attribute.
     """
-    assert isinstance(orig_linear, nn.Linear) or (orig_linear.__class__ == te.Linear)
+    assert isinstance(orig_linear, nn.Linear) or (_TE_AVAILABLE and orig_linear.__class__ == te.Linear)
     assert not hasattr(orig_linear, "super_fwd"), orig_linear.super_fwd
 
     if isinstance(orig_linear, nn.Linear):
         LinearAdapter._init_adapter(orig_linear, dim, alpha, dropout, dropout_position, lora_A_init_method, lora_dtype)
         cls = orig_linear.__class__
         new_cls = type("PatchedLinearAdapter", (LinearAdapter, cls), {})
-    elif orig_linear.__class__ == te.Linear:
+    elif _TE_AVAILABLE and orig_linear.__class__ == te.Linear:
         TELinearAdapter._init_adapter(
             orig_linear, dim, alpha, dropout, dropout_position, lora_A_init_method, lora_dtype
         )
         cls = orig_linear.__class__
         new_cls = type("PatchedTELinearAdapter", (TELinearAdapter, cls), {})
     else:
-        raise NotImplementedError("Expected isinstance(orig_linear, (nn.Linear, te.Linear))")
+        raise NotImplementedError("Expected isinstance(orig_linear, (nn.Linear, te.Linear))")  # te.Linear only if _TE_AVAILABLE
 
     # If the model uses quantized weights, we want to use orig_linear's forward
     if (

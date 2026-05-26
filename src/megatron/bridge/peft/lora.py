@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 import logging
 from dataclasses import dataclass, field
 from typing import List, Literal, Optional
@@ -19,8 +21,14 @@ from typing import List, Literal, Optional
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-import transformer_engine.pytorch as te
 from megatron.core import parallel_state
+
+try:
+    import transformer_engine.pytorch as te
+    _TE_AVAILABLE = True
+except ImportError:
+    te = None  # type: ignore[assignment]
+    _TE_AVAILABLE = False
 from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.utils import unwrap_model
 
@@ -127,7 +135,7 @@ class LoRA(PEFT, ModuleMatcher):
 
         if (ans := self.match(module, name, prefix)) is not None:
             _, full_name = ans
-            if (isinstance(module, nn.Linear) or (module.__class__ == te.Linear)) and not is_modelopt_linear(module):
+            if (isinstance(module, nn.Linear) or (_TE_AVAILABLE and module.__class__ == te.Linear)) and not is_modelopt_linear(module):
                 # Will use the `patch_linear_module` function if:
                 # - is FSDP v1
                 # - is DTensor (has _local_tensor attribute)
@@ -138,7 +146,7 @@ class LoRA(PEFT, ModuleMatcher):
                     and module.quant_state.__class__ == bitsandbytes.functional.QuantState
                 ):
                     lora_cls = patch_linear_module
-                elif module.__class__ == te.Linear:
+                elif _TE_AVAILABLE and module.__class__ == te.Linear:
                     lora_cls = TELinearAdapter
                 else:
                     lora_cls = LinearAdapter
