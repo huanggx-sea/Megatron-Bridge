@@ -190,9 +190,14 @@ class Qwen3VLGPTModel(GPTModel):
             _original_embedding = self.embedding
 
             def _mtp_embedding(input_ids, position_ids):
+                # lm_input_ids from slime is 1-D (T_local,) — see model.py input_ids[0].
+                # LanguageModelEmbedding.forward does an unconditional .transpose(0,1):
+                #   1-D (T,)   → word_embeddings → (T, H) → transpose → (H, T)  ← WRONG
+                #   2-D (1, T) → word_embeddings → (1, T, H) → transpose → (T, 1, H)  ← correct
                 if input_ids.dim() == 1:
-                    input_ids = input_ids.unsqueeze(0)
+                    input_ids = input_ids.unsqueeze(0)  # (T_local,) → (1, T_local)
                 out = _original_embedding(input_ids=input_ids, position_ids=position_ids)
+                # out: (T_local, 1, H)
                 if self.config.sequence_parallel:
                     out = tensor_parallel.scatter_to_sequence_parallel_region(out)
                 return out

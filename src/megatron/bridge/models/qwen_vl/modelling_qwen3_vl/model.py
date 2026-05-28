@@ -491,10 +491,12 @@ class Qwen3VLModel(MegatronModule):
                             cp_group=self.pg_collection.cp,
                         )
 
+            # slime: input_ids shape is (1, T_local) — batch dim = 1 (dummy), seq dim = T_local
+            # (T_local = T_global / cp_size, e.g. 25472 with T_global=101888, cp_size=4)
             combined_embeddings = self.language_model.embedding(
                 input_ids=input_ids,
                 position_ids=None,  # NOTE: disable
-            ).clone()  # [text_seq_len, b, h_language]
+            ).clone()  # [text_seq_len, b, h_language] = (T_local, 1, H)
 
             if vision_embeds is not None:
                 combined_embeddings = combined_embeddings.transpose(0, 1).contiguous()
@@ -518,6 +520,13 @@ class Qwen3VLModel(MegatronModule):
                 # Data is already THD-shaped and per-CP-rank. Just drop the
                 # batch dim from input_ids to get the (T_local,) THD form, and
                 # leave combined_embeddings/vision_mask as-is.
+                # input_ids:    (1, T_local)  — dummy batch-dim-1 from slime
+                # input_ids[0]: (T_local,)    — 1-D flat token ID stream for THD
+                # The 1-D form is what Megatron's transformer blocks expect for
+                # THD input_ids. Note: the main decoder path does NOT call
+                # embedding on this — it uses decoder_input=combined_embeddings.
+                # Only MTP's _get_embeddings uses lm_input_ids directly; see the
+                # unsqueeze fix in text_model.py for why MTP needs it re-2D'd.
                 lm_input_ids = input_ids[0]
             elif packed_seq_params is not None:
                 if attention_mask is None:
@@ -581,6 +590,8 @@ class Qwen3VLModel(MegatronModule):
                     and int(packed_seq_params.cu_seqlens_q[-1]) == input_ids.size(1) * cp_size
                 )
                 if _slime_pre_sharded_pp:
+                    # input_ids: (1, T_local) → input_ids[0]: (T_local,)
+                    # Same squeeze as the pre_process branch above.
                     lm_input_ids = input_ids[0]
                 else:
                     if attention_mask is None:
