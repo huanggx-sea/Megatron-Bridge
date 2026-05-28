@@ -127,17 +127,31 @@ class LoRALinearSplitQKV(AdapterWrapper):
 
         heads_per_group = head_num // num_query_groups
 
+        # When attention_output_gate=True, adapter_q output is [Q, Gate] concatenated
+        # (first head_num*head_size = Q, next head_num*head_size = Gate).
+        # Megatron's packed format per group is [q_heads, gate_heads, k_head, v_head].
+        attention_output_gate = getattr(config, "attention_output_gate", False)
+
         leading_shape = query.shape[:-1]
-        query = query.reshape(-1, head_num, head_size)
+        if attention_output_gate:
+            q_part = query[..., : head_num * head_size].reshape(-1, head_num, head_size)
+            gate_part = query[..., head_num * head_size :].reshape(-1, head_num, head_size)
+        else:
+            q_part = query.reshape(-1, head_num, head_size)
+            gate_part = None
         key = key.reshape(-1, num_query_groups, head_size)
         value = value.reshape(-1, num_query_groups, head_size)
 
         qkv_chunks = []
         for i in range(num_query_groups):
-            q_group = query[:, i * heads_per_group : (i + 1) * heads_per_group, :]
+            q_group = q_part[:, i * heads_per_group : (i + 1) * heads_per_group, :]
             k_group = key[:, i : i + 1, :]
             v_group = value[:, i : i + 1, :]
-            qkv_chunks.extend([q_group, k_group, v_group])
+            if gate_part is not None:
+                gate_group = gate_part[:, i * heads_per_group : (i + 1) * heads_per_group, :]
+                qkv_chunks.extend([q_group, gate_group, k_group, v_group])
+            else:
+                qkv_chunks.extend([q_group, k_group, v_group])
 
         qkv = torch.cat(qkv_chunks, dim=1)
         return qkv.reshape(*leading_shape, -1)
@@ -383,6 +397,12 @@ class CanonicalLoRA(PEFT, ModuleMatcher):
                 adapter_q, adapter_k, adapter_v = None, None, None
                 kv_out_features = m.config.kv_channels * m.config.num_query_groups
                 q_out_features = m.config.kv_channels * m.config.num_attention_heads
+                # With attention_output_gate, the gated path doubles Q's output
+                # (Q concatenated with a same-sized gate). Both halves live in
+                # linear_qkv's Q slice produced by split_qkv_weights, so the LoRA
+                # adapter for Q must match the doubled output size.
+                if getattr(m.config, "attention_output_gate", False):
+                    q_out_features *= 2
                 if "linear_q" in canonical_submodules:
                     adapter_q = adapter_cls(attrs.in_features, q_out_features, **adapter_kwargs)
                 if "linear_k" in canonical_submodules:

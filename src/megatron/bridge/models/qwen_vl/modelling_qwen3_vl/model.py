@@ -503,7 +503,23 @@ class Qwen3VLModel(MegatronModule):
 
             if combined_embeddings is not None and cp_size > 1 and packed_seq_params is None:
                 combined_embeddings = split_data_cp_rank(combined_embeddings, cp_size, 0, cp_rank)
-            if packed_seq_params is not None:
+            # Detect slime's pre-CP-sharded packed-seq convention. slime calls
+            # the model with `input_ids` already sliced to `T_global / cp_size`
+            # per CP rank and `cu_seqlens` scaled by `cp_size` so its last entry
+            # equals `input_ids.size(1) * cp_size`. The default verl-style branch
+            # below would CP-shard again, giving `cp_size**2` effective sharding
+            # — see ft-slime/dev/gdn_packed_seq_cuda_assert.md.
+            slime_pre_sharded = (
+                packed_seq_params is not None
+                and cp_size > 1
+                and int(packed_seq_params.cu_seqlens_q[-1]) == input_ids.size(1) * cp_size
+            )
+            if packed_seq_params is not None and slime_pre_sharded:
+                # Data is already THD-shaped and per-CP-rank. Just drop the
+                # batch dim from input_ids to get the (T_local,) THD form, and
+                # leave combined_embeddings/vision_mask as-is.
+                lm_input_ids = input_ids[0]
+            elif packed_seq_params is not None:
                 if attention_mask is None:
                     attention_mask = torch.ones_like(input_ids, dtype=torch.bool, device=input_ids.device)
                 input_ids_thd, _ = preprocess_packed_seqs(
@@ -560,11 +576,20 @@ class Qwen3VLModel(MegatronModule):
             # On non-pre_process PP stages (e.g. the last stage where MTP runs),
             # convert lm_input_ids to THD format so it matches position_ids.
             if packed_seq_params is not None:
-                if attention_mask is None:
-                    attention_mask = torch.ones_like(input_ids, dtype=torch.bool, device=input_ids.device)
-                lm_input_ids, _ = preprocess_packed_seqs(
-                    input_ids, attention_mask, pre_process=True, pg_collection=self.pg_collection
+                _slime_pre_sharded_pp = (
+                    cp_size > 1
+                    and int(packed_seq_params.cu_seqlens_q[-1]) == input_ids.size(1) * cp_size
                 )
+                if _slime_pre_sharded_pp:
+                    lm_input_ids = input_ids[0]
+                else:
+                    if attention_mask is None:
+                        attention_mask = torch.ones_like(
+                            input_ids, dtype=torch.bool, device=input_ids.device
+                        )
+                    lm_input_ids, _ = preprocess_packed_seqs(
+                        input_ids, attention_mask, pre_process=True, pg_collection=self.pg_collection
+                    )
 
         visual_pos_masks = vision_mask
         deepstack_visual_embeds = deepstack_feature_lists
@@ -606,17 +631,25 @@ class Qwen3VLModel(MegatronModule):
                 attention_mask=hf_attention_mask,
             )  #  [3*b*s]
             if packed_seq_params is not None:
-                # convert position_ids to THD format
-                position_ids = (
-                    preprocess_packed_seqs(
-                        position_ids.permute(1, 2, 0),
-                        attention_mask,
-                        pre_process=True,
-                        pg_collection=self.pg_collection,
-                    )[0]
-                    .permute(2, 0, 1)
-                    .contiguous()
+                _slime_pre_sharded_pos = (
+                    cp_size > 1
+                    and int(packed_seq_params.cu_seqlens_q[-1]) == input_ids.size(1) * cp_size
                 )
+                if _slime_pre_sharded_pos:
+                    # Already per-CP-rank; just mark THD and clear the mask.
+                    position_ids = position_ids.contiguous()
+                else:
+                    # convert position_ids to THD format
+                    position_ids = (
+                        preprocess_packed_seqs(
+                            position_ids.permute(1, 2, 0),
+                            attention_mask,
+                            pre_process=True,
+                            pg_collection=self.pg_collection,
+                        )[0]
+                        .permute(2, 0, 1)
+                        .contiguous()
+                    )
                 attention_mask = None
                 self.language_model.rotary_pos_emb.is_thd_format = True
 

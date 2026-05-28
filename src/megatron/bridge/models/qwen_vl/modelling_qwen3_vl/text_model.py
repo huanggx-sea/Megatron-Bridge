@@ -177,19 +177,28 @@ class Qwen3VLGPTModel(GPTModel):
 
         # MTP calls self.embedding directly (bypassing the manual SP scatter that
         # model.py does for the combined VL embeddings). Temporarily wrap the embedding
-        # to apply the SP scatter so its output shape matches hidden_states.
+        # to:
+        #   1. Unsqueeze 1-D input_ids to 2-D before calling the embedding, because
+        #      LanguageModelEmbedding.forward does transpose(0,1) unconditionally.
+        #      For 1-D input (T,) that transpose produces (H, T) instead of (T, 1, H).
+        #      Slime's slime-pre-sharded path passes 1-D input_ids (input_ids[0]).
+        #   2. Apply the SP scatter so its output shape matches hidden_states (when SP).
         # We write to self.__dict__ directly to bypass nn.Module.__setattr__'s type
         # check, which rejects non-Module values for registered child modules.
         _shadow_embedding = False
-        if self.mtp_process and self.config.sequence_parallel:
+        if self.mtp_process:
             _original_embedding = self.embedding
 
-            def _sp_scatter_embedding(input_ids, position_ids):
+            def _mtp_embedding(input_ids, position_ids):
+                if input_ids.dim() == 1:
+                    input_ids = input_ids.unsqueeze(0)
                 out = _original_embedding(input_ids=input_ids, position_ids=position_ids)
-                return tensor_parallel.scatter_to_sequence_parallel_region(out)
+                if self.config.sequence_parallel:
+                    out = tensor_parallel.scatter_to_sequence_parallel_region(out)
+                return out
 
-            _sp_scatter_embedding.word_embeddings = _original_embedding.word_embeddings
-            self.__dict__["embedding"] = _sp_scatter_embedding
+            _mtp_embedding.word_embeddings = _original_embedding.word_embeddings
+            self.__dict__["embedding"] = _mtp_embedding
             _shadow_embedding = True
 
         result = self._postprocess(
