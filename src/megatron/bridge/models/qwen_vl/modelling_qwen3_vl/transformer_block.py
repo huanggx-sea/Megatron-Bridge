@@ -721,6 +721,7 @@ class Qwen3VLTransformerBlock(TransformerBlock):
 
         with rng_context, outer_fp8_context:
             # Forward pass.
+            # print(f"[DEBUG_RECOMPUTE] {self.config.recompute_granularity} {self.training}")
             if self.config.recompute_granularity == "full" and self.training:
                 hidden_states = self._checkpointed_forward(
                     hidden_states=hidden_states,
