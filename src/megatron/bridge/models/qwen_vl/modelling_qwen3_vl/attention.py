@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
+
 from einops import rearrange
 from megatron.core.transformer.attention import (
     HAVE_FA3,
@@ -217,7 +219,35 @@ class Qwen3VLSelfAttention(SelfAttention):
         # ==================================
 
         nvtx_range_push(suffix="core_attention")
-        if self.checkpoint_core_attention and self.training:
+        prefix_len = packed_seq_params.prefix_len if packed_seq_params is not None else None
+        if prefix_len is not None:
+            # Shared-prefix GRPO response packing: each response attends the single
+            # shared prefix + its own causal context (TE/cu_seqlens attention would
+            # make responses independent and lose the prefix). RoPE is already
+            # correct because the absolute per-token freqs come from the logical
+            # position_ids built upstream (build_prefix_position_ids). See
+            # ft-slime/dev/longprefix/prefix_response_packing_impl.md §2.
+            from megatron.core.transformer.flex_prefix_attention import (
+                build_prefix_block_mask,
+                flex_prefix_attention,
+            )
+
+            block_mask = getattr(packed_seq_params, "_prefix_block_mask", None)
+            if block_mask is None:
+                block_mask = build_prefix_block_mask(
+                    prefix_len, packed_seq_params.cu_seqlens_q, total_len=query.shape[0]
+                )
+                # cache so the 6 attention layers reuse one mask per microbatch
+                packed_seq_params._prefix_block_mask = block_mask
+            # TE's DotProductAttention does not expose its scale; it defaults to
+            # 1/sqrt(head_dim), which is what the baseline uses. Match it.
+            softmax_scale = getattr(self.core_attention, "softmax_scale", None)
+            if softmax_scale is None:
+                softmax_scale = 1.0 / math.sqrt(self.hidden_size_per_attention_head)
+            core_attn_out = flex_prefix_attention(
+                query, key, value, block_mask, softmax_scale
+            )
+        elif self.checkpoint_core_attention and self.training:
             core_attn_out = self._checkpointed_attention_forward(
                 query,
                 key,
