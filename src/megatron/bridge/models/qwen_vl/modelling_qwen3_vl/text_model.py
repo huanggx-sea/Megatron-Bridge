@@ -120,6 +120,7 @@ class Qwen3VLGPTModel(GPTModel):
         *,
         inference_params: Optional[BaseInferenceContext] = None,
         loss_mask: Optional[Tensor] = None,
+        response_only_logits: bool = False,
         # args for deepstack
         visual_pos_masks: Optional[torch.Tensor] = None,
         deepstack_visual_embeds: Optional[list[torch.Tensor]] = None,
@@ -224,6 +225,7 @@ class Qwen3VLGPTModel(GPTModel):
             runtime_gather_output=runtime_gather_output,
             extra_block_kwargs=extra_block_kwargs,
             inference_context=inference_context,
+            response_only_logits=response_only_logits,
         )
 
         if _shadow_embedding:
