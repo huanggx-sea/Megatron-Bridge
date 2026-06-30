@@ -626,7 +626,23 @@ class Qwen3VLModel(MegatronModule):
                     sequence_parallel=self.config.sequence_parallel,
                 )
 
-        if position_ids is None:
+        # Shared-prefix GRPO response packing: the buffer is [P | R0 | ... | R_{G-1}]
+        # and each response must restart its RoPE positions at the prefix length
+        # (its logical position in [P|R_i]) — NOT continue sequentially over the buffer,
+        # which is what get_rope_index would give and which diverges ~25%. Build the
+        # logical positions from prefix_len + cu_seqlens and skip get_rope_index.
+        _prefix_len = getattr(packed_seq_params, "prefix_len", None) if packed_seq_params is not None else None
+        if _prefix_len is not None:
+            from megatron.core.transformer.flex_prefix_attention import build_prefix_position_ids
+
+            pos1d = build_prefix_position_ids(_prefix_len, packed_seq_params.cu_seqlens_q)  # [T] unpadded
+            T_pad = input_ids.size(1)
+            if pos1d.size(0) < T_pad:  # buffer padded beyond cu_seqlens[-1]; pad tokens are masked
+                pos1d = torch.nn.functional.pad(pos1d, (0, T_pad - pos1d.size(0)))
+            position_ids = pos1d.view(1, 1, -1).expand(3, 1, -1).contiguous()
+            attention_mask = None
+            self.language_model.rotary_pos_emb.is_thd_format = True
+        elif position_ids is None:
             # BSHD
             # Megatron uses 4D bool masks ([B|1,1,S,S], True=masked); HF uses 2D keep masks ([B,S], 1=keep)
             # For simplicity, we set hf_attention_mask to None.
