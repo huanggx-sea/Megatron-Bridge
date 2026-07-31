@@ -73,7 +73,13 @@ class LoRALinear(AdapterWrapper):
 
 
 class LoRATopKRouter(AdapterWrapper):
-    """Adapter wrapper that applies LoRA to router gating logits."""
+    """Adapter wrapper that applies LoRA to router gating logits.
+
+    Mirrors ``TopKRouter.forward`` step by step (float32 expert-bias maintenance,
+    input jitter, gating, forced load balancing / biased logits, routing), inserting
+    the LoRA delta on the gating logits. If ``TopKRouter.forward`` changes upstream,
+    this method must be kept in sync.
+    """
 
     def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any):
         """Forward pass that adds LoRA delta to router logits before routing."""
@@ -85,6 +91,12 @@ class LoRATopKRouter(AdapterWrapper):
             logits = logits + adapter_output.to(dtype=logits.dtype)
         if self.to_wrap.config.moe_router_force_load_balancing:
             logits = apply_random_logits(logits)
+        if getattr(self.to_wrap.config, "moe_router_force_biased", None) is not None:
+            from megatron.core.transformer.moe.moe_utils import apply_biased_logits
+
+            logits = apply_biased_logits(
+                logits, self.to_wrap.config.moe_router_force_biased, self.to_wrap.layer_number
+            )
         return self.to_wrap.routing(logits, *args, **kwargs)
 
 

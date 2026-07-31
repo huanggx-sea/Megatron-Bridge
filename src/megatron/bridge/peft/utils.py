@@ -1146,10 +1146,23 @@ class GroupedExpertLinearAdapter(nn.Module):
         )
         return torch.cat(gathered, dim=-1)
 
+    @staticmethod
+    def _grouped_mm_fn():
+        """Return the available grouped-GEMM function, preferring the public API.
+
+        torch exposes ``nn.functional.grouped_mm`` only in newer releases; 2.9 still
+        ships the same kernel as the private ``torch._grouped_mm`` (identical
+        signature and offs semantics), which several MoE stacks already rely on.
+        """
+        fn = getattr(nn.functional, "grouped_mm", None)
+        if fn is None:
+            fn = getattr(torch, "_grouped_mm", None)
+        return fn
+
     def _can_use_grouped_mm(self, x: torch.Tensor) -> bool:
         """Return whether the grouped GEMM fast path is supported for this input."""
 
-        if getattr(nn.functional, "grouped_mm", None) is None:
+        if self._grouped_mm_fn() is None:
             return False
         if not x.is_cuda or x.dtype != torch.bfloat16:
             return False
@@ -1180,6 +1193,14 @@ class GroupedExpertLinearAdapter(nn.Module):
         """Return whether the TEGroupedMLP fast path is supported for this input."""
 
         if not (HAVE_TE_PYTORCH_GROUPED_LINEAR and HAVE_TE_PYTORCH_GROUPED_LINEAR_AUTOGRAD):
+            return False
+        # _forward_te_grouped_linear drives the TE module manually through the
+        # `x = prepare_forward(x); ...; end_forward()` API. TE releases where
+        # prepare_forward is a context manager (e.g. 2.7.0) have no end_forward and
+        # return a context object instead of the tensor, so the manual drive crashes
+        # (AttributeError: 'GroupedLinear' object has no attribute 'end_forward').
+        # Fall back to grouped_mm / per-expert on those releases.
+        if not hasattr(TEPytorchGroupedLinear, "end_forward"):
             return False
         if not x.is_cuda:
             return False
@@ -1306,7 +1327,7 @@ class GroupedExpertLinearAdapter(nn.Module):
             return self._forward_te_grouped_linear(x, weight=weight, m_splits=m_splits)
         if offs is None:
             offs = self._build_grouped_mm_offsets(m_splits, device=x.device)
-        return nn.functional.grouped_mm(x, weight.transpose(1, 2), offs=offs)
+        return self._grouped_mm_fn()(x, weight.transpose(1, 2), offs=offs)
 
     def _forward_per_expert(
         self,
